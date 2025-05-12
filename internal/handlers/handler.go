@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/NailUsmanov/practicum-shortener-url/internal/middleware"
 	"github.com/NailUsmanov/practicum-shortener-url/internal/models"
 	"github.com/NailUsmanov/practicum-shortener-url/internal/storage"
 	"github.com/go-chi/chi"
@@ -18,6 +19,10 @@ import (
 
 func NewCreateShortURL(s storage.Storage, baseURL string, sugar *zap.SugaredLogger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if s == nil {
+			http.Error(w, "storage is nil", http.StatusInternalServerError)
+			return
+		}
 		sugar.Infof("Request headers: %+v", r.Header)
 
 		// Проверяем метод
@@ -26,11 +31,11 @@ func NewCreateShortURL(s storage.Storage, baseURL string, sugar *zap.SugaredLogg
 			return
 		}
 		// Проверяем Content-Type
-		contentType := r.Header.Get("Content-Type")
-		if contentType != "" && !strings.HasPrefix(contentType, "text/plain") {
-			http.Error(w, "Content-Type must be text/plain", http.StatusBadRequest)
-			return
-		}
+		// contentType := r.Header.Get("Content-Type")
+		// if contentType != "" && !strings.HasPrefix(contentType, "text/plain") {
+		// 	http.Error(w, "Content-Type must be text/plain", http.StatusBadRequest)
+		// 	return
+		// }
 		sugar.Infof("Content-Type: %s", r.Header.Get("Content-Type"))
 		// Читаем тело запроса
 		body, err := io.ReadAll(r.Body)
@@ -53,35 +58,43 @@ func NewCreateShortURL(s storage.Storage, baseURL string, sugar *zap.SugaredLogg
 		// Проверяем валидность URL
 		_, err = url.ParseRequestURI(rawURL)
 		if err != nil {
+			sugar.Errorf("Invalid URL: %s", rawURL)
 			http.Error(w, "Invalid URL format", http.StatusBadRequest)
 			return
 		}
+		// Получаем userID из контекста
+		userID, _ := r.Context().Value(middleware.UserIDKey).(string)
 
 		// Проверяем наличие оригинального УРЛ в нашей мапе
-		existsKey, err := s.GetByURL(r.Context(), rawURL)
-		if err == nil && existsKey != "" {
-			sugar.Infof("URL already exists: %s -> %s", rawURL, existsKey)
+		existsKey, err := s.GetByURL(r.Context(), rawURL, userID)
+		if err != nil {
+			if !errors.Is(err, storage.ErrNotFound) {
+				sugar.Errorf("Storage unexpected error: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+		}
+		if existsKey != "" {
+			sugar.Infof("URL exists: %s -> %s", rawURL, existsKey)
 			w.Header().Set("Content-Type", "text/plain")
 			w.WriteHeader(http.StatusConflict)
-			w.Write([]byte(baseURL + "/" + existsKey))
-			return
-		}
-
-		// Обрабатываем другие ошибки (кроме "не найдено")
-		if err != nil {
-			sugar.Errorf("Error checking URL existence: %v", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			fmt.Fprintf(w, "%s/%s", baseURL, existsKey) // Используем fmt.Fprintf вместо Write
 			return
 		}
 
 		// Сохраняем URL
-		key, err := s.Save(r.Context(), rawURL)
+		key, err := s.Save(r.Context(), rawURL, userID)
 		if err != nil {
-			sugar.Errorf("Failed to save URL: %v", err)
-			http.Error(w, "Invalid URL format", http.StatusBadRequest)
+			if errors.Is(err, storage.ErrAlreadyHasKey) {
+				w.Header().Set("Content-Type", "text/plain")
+				w.WriteHeader(http.StatusConflict)
+				fmt.Fprintf(w, "%s/%s", baseURL, key)
+				return
+			}
+			sugar.Errorf("Save error: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-
 		// Возвращаем ответ
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusCreated)
@@ -95,10 +108,18 @@ func NewRedirect(s storage.Storage, sugar *zap.SugaredLogger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// 1. Получаем ID из URL
 		key := chi.URLParam(r, "id")
+		if key == "" {
+			http.Error(w, "Empty URL ID", http.StatusBadRequest)
+			return
+		}
 		// 2. Ищем оригинальный URL
 		url, err := s.Get(r.Context(), key)
 		if err != nil {
 			http.NotFound(w, r)
+			return
+		}
+		if url == "" {
+			http.Error(w, "URL not found", http.StatusNotFound)
 			return
 		}
 		// 3. Делаем редирект
@@ -121,9 +142,8 @@ func NewPingHandler(s storage.Storage, sugar *zap.SugaredLogger) http.HandlerFun
 func NewCreateShortURLJSON(s storage.Storage, baseURL string, sugar *zap.SugaredLogger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 
-		// Проверяем метод
-		if r.Method != http.MethodPost {
-			http.Error(w, "Only POST requests are allowed", http.StatusBadRequest)
+		if r.Header.Get("Content-Type") != "application/json" {
+			http.Error(w, "Invalid content type", http.StatusBadRequest)
 			return
 		}
 
@@ -147,9 +167,12 @@ func NewCreateShortURLJSON(s storage.Storage, baseURL string, sugar *zap.Sugared
 		}
 
 		// Сохраняем URL
-		key, err := s.Save(r.Context(), req.URL)
+		// Получаем UserID из контекста
+		userID, _ := r.Context().Value(middleware.UserIDKey).(string)
+		key, err := s.Save(r.Context(), req.URL, userID)
 		if err != nil {
 			if errors.Is(err, storage.ErrAlreadyHasKey) {
+				sugar.Errorf("Save error: %v", err)
 				var resp models.Response
 				resp.Result = baseURL + "/" + key
 				w.Header().Set("Content-Type", "application/json")
@@ -181,6 +204,10 @@ func NewCreateShortURLJSON(s storage.Storage, baseURL string, sugar *zap.Sugared
 
 func NewCreateBatchJSON(s storage.Storage, baseURL string, sugar *zap.SugaredLogger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		sugar.Infof("CreateBatchJSON started, headers: %v", r.Header)
+		// Получаем UserID из контекста
+		userID, _ := r.Context().Value(middleware.UserIDKey).(string)
+		sugar.Infof("UserID from context: %s", userID)
 
 		// Строгая проверка Content-Type
 		if r.Header.Get("Content-Type") != "application/json" {
@@ -219,12 +246,12 @@ func NewCreateBatchJSON(s storage.Storage, baseURL string, sugar *zap.SugaredLog
 			urls = append(urls, item.OriginalURL)
 		}
 
-		keys, err := s.SaveInBatch(r.Context(), urls)
+		keys, err := s.SaveInBatch(r.Context(), urls, userID)
 		if err != nil {
 			if errors.Is(err, storage.ErrAlreadyHasKey) {
 
 				for _, url := range urls {
-					if key, err := s.GetByURL(r.Context(), url); err == nil {
+					if key, err := s.GetByURL(r.Context(), url, userID); err == nil {
 						w.Header().Set("Content-Type", "application/json")
 						w.WriteHeader(http.StatusConflict)
 						json.NewEncoder(w).Encode(map[string]string{
@@ -254,6 +281,43 @@ func NewCreateBatchJSON(s storage.Storage, baseURL string, sugar *zap.SugaredLog
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
+
+		enc := json.NewEncoder(w)
+		if err := enc.Encode(resp); err != nil {
+			sugar.Error("error encoding response:", err)
+		}
+	}
+}
+
+// GET /api/user/urls
+func GetUserURLS(s storage.Storage, baseURL string, sugar *zap.SugaredLogger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		userID, ok := r.Context().Value(middleware.UserIDKey).(string)
+		if !ok || userID == "" {
+			w.WriteHeader(http.StatusUnauthorized) // 401 для неавторизованных
+			return
+		}
+
+		urls, err := s.GetUserURLS(r.Context(), userID)
+		if err != nil {
+			sugar.Errorf("GetUserURLS error: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if len(urls) == 0 {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		var resp []models.UserURLs
+		for short, original := range urls {
+			resp = append(resp, models.UserURLs{
+				ShortURL:    baseURL + "/" + short,
+				OriginalURL: original,
+			})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
 
 		enc := json.NewEncoder(w)
 		if err := enc.Encode(resp); err != nil {
